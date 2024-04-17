@@ -1,0 +1,3 @@
+dependencies:
+  components/arduino: "*"
+  components/ESP32-Servo: "*"

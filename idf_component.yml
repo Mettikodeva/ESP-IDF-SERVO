@@ -1,0 +1,4 @@
+version: "0.0.1"
+description: "This is a test component for ESP32-Servo"
+license: "MIT"
+
