@@ -4,15 +4,22 @@
 #include "freertos/timers.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "driver/ledc.h"
+// #include "driver/ledc.h"
+#include "driver/mcpwm_prelude.h"
 #include "Arduino.h"
 #include <cmath>
+
 
 
 
 #define MIN_PULSE_WIDTH       500     // the shortest pulse sent to a servo  
 #define MAX_PULSE_WIDTH      2500     // the longest pulse sent to a servo 
 #define DEFAULT_PULSE_WIDTH  1500     // default pulse width when servo is attached
+#define SERVO_MAX_DEG        90      // maximum angle in degrees
+#define SERVO_MIN_DEG        -90        // minimum angle in degrees
+
+#define SERVO_TIMEBASE_RESOLUTION_HZ 1000000  // 1MHz, 1us per tick
+#define SERVO_TIMEBASE_PERIOD 20000 // 20000us, 20ms period
 
 /*
     This servo class is used to control a servo motor using the LEDC peripheral of the ESP32.
@@ -48,39 +55,39 @@ namespace ESP32Servo{
         
         void begin();
         void begin(SemaphoreHandle_t *mutex);
+        void syncTimerTEZ(mcpwm_timer_handle_t timers[]);
+        void get_timer(mcpwm_timer_handle_t *timer);
 
         void setFrequency(uint32_t frequency);
-
-        void setTimer(ledc_timer_t timer);
-        void setTimer(int timer);
-
-        void setResolution(ledc_timer_bit_t resolution);
-        void setResolution(int resolution);
-
-        void setChannel(ledc_channel_t channel);
-        void setChannel(int channel);
 
         bool calibrate();
         bool calibrate(int);
         void setCalibration(int analog_min, int analog_max, int pwm_min, int pwm_max);
         void setAngleDegreesLimit(float min, float max);
-        void writeTicks(int ticks);
+        void setGroup(int group);
         void writeMicroseconds(int usec);
-        void writeTicksSafe(int ticks);
-        void writeMicrosecondsSafe(int usec);
-        int get_ticks();
         int get_pwm();
-
         int read();
         float readDeg();
 
-
-        int usToTicks(int usec);
-        int ticksToUs(int ticks);
-
     private:
-        ledc_channel_t _channel;
+
+        //MARK: MCPWM 
+        // Timer
+        mcpwm_timer_handle_t _timer= NULL;
+        mcpwm_timer_config_t _timer_conf;
+        // operator
+        mcpwm_oper_handle_t _oper= NULL;
+        mcpwm_operator_config_t _oper_conf;
+        // comparator
+        mcpwm_cmpr_handle_t _comparator= NULL;
+        mcpwm_comparator_config_t _comparator_conf;
+        // generator
+        mcpwm_gen_handle_t _generator= NULL;
+        mcpwm_generator_config_t _generator_conf;
+
         int _pwm_pin;
+        int _pwm_val; // in microseconds
         int _feedback_pin;
         uint32_t _cur_ticks;
         // not yet used
@@ -89,9 +96,6 @@ namespace ESP32Servo{
         // float _angle;
         // int _prev_feedback;
 
-        ledc_timer_bit_t _resolution;
-        ledc_timer_t _timer;
-        ledc_mode_t _mode;
         uint32_t _frequency;
 
         int _duty;
@@ -106,8 +110,6 @@ namespace ESP32Servo{
         float _deg_min;
         bool _use_feedback;
         char *_name;
-
-        void _check_max_pwm(void *);
 
         double _map(double val, double in_min, double in_max, double out_min, double out_max);
         float _map(int val, int in_min, int in_max, float out_min, float out_max);

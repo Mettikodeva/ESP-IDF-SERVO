@@ -1,7 +1,13 @@
 #include "ESP32-Servo.h"
 
 // #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+
 // ESP_LOG_LEVEL_LOCAL(ESP_LOG_INFO);
+static inline uint32_t example_angle_to_compare(int angle)
+{
+    return (angle - 0) * (MAX_PULSE_WIDTH - MIN_PULSE_WIDTH) / (90 - 0) + MIN_PULSE_WIDTH;
+}
+
 namespace ESP32Servo{
 
 Servo::Servo() : Servo(MIN_PULSE_WIDTH, MAX_PULSE_WIDTH, false){}
@@ -11,13 +17,29 @@ Servo::Servo(int min, int max): Servo(min, max, false){}
 Servo::Servo(bool use_feedback): Servo(MIN_PULSE_WIDTH, MAX_PULSE_WIDTH, use_feedback){}
 
 Servo::Servo(int min, int max, bool use_feedback){
-    _timer = LEDC_TIMER_MAX; // MAX for unset
-    _resolution = LEDC_TIMER_16_BIT;
-    _channel = LEDC_CHANNEL_MAX; // MAX for unset
-    _mode = LEDC_LOW_SPEED_MODE;
-    _frequency = 50;
-    // _angle = 0;
-    // _duty = -1;
+
+    // MCPWM TIMER
+    _timer_conf = {
+        .group_id = 0,
+        .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
+        .resolution_hz = SERVO_TIMEBASE_RESOLUTION_HZ,
+        .period_ticks = SERVO_TIMEBASE_PERIOD,
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
+    };
+    // MCPWM OPERATOR
+    _oper_conf = {
+        .group_id = 0, // operator must be in the same group to the timer
+    };
+
+    // MCPWM COMPARATOR
+    _comparator_conf = {
+        .flags.update_cmp_on_tez = true, // update the comparator value on the next timer zero event
+    };
+
+    // MCPWM GENERATOR
+    _generator_conf = {
+        .gen_gpio_num = _pwm_pin,
+    };
 
     // for constraint the movement of the servo
     _feedback = -1;
@@ -36,29 +58,19 @@ Servo::Servo(int min, int max, bool use_feedback){
     strcpy(_name, "servo name not set");
 }
 
+
 Servo::~Servo(){
     // Destructor
     free(_name);
-    ledc_stop(_mode, _channel, 0);
+    mcpwm_del_timer(_timer);
+    mcpwm_del_operator(_oper);
+    mcpwm_del_comparator(_comparator);
+    mcpwm_del_generator(_generator);
 }
-
 
 void Servo::setPwmPin(int pin){
     // Set the PWM pin
     _pwm_pin = pin;
-}
-
-void Servo::setTimer(ledc_timer_t timer){
-    // Set the timer
-    if (timer < 0 || timer > LEDC_TIMER_MAX - 1) {
-        ESP_LOGE(_name, "Invalid timer: %d. Valid timers are 0-%d", (int)timer, (int)(LEDC_TIMER_MAX - 1));
-        return;
-    }
-    _timer = timer;
-}
-
-void Servo::setTimer(int timer){
-    this->setTimer((ledc_timer_t)timer);
 }
 
 void Servo::setFeedbackPin(int pin){
@@ -73,102 +85,45 @@ void Servo::setFeedbackPin(int pin){
     pinMode(_feedback_pin, INPUT);
 }
 
-void Servo::setFrequency(uint32_t frequency){
-    // Set the frequency
-    if(frequency != 50){
-        ESP_LOGW(_name, "The frequency is set to: %d. Common Hobby servo frequency is 50Hz.", (int)frequency);
-    }
-    _frequency = frequency;
-}
-
-void Servo::setChannel(ledc_channel_t channel){
-    if (channel < 0 || channel > LEDC_CHANNEL_MAX - 1) {
-        ESP_LOGE(_name, "Invalid channel: %d. Valid channels are 0-%d", (int)channel, (int)(LEDC_CHANNEL_MAX-1));
-        return;
-    }
-    _channel = channel;
-}
-
-void Servo::setChannel(int channel){
-    this->setChannel((ledc_channel_t)channel);
-}
-
-void Servo::setResolution(ledc_timer_bit_t resolution){
-    if (resolution < 0 || resolution > LEDC_TIMER_BIT_MAX - 1) {
-        ESP_LOGE(_name, "Invalid resolution: %d. Valid resolutions are 0-%d", (int)resolution, (int)(LEDC_TIMER_BIT_MAX-1));
-        return;
-    }
-    _resolution = resolution;
-}
-
-void Servo::setResolution(int resolution){
-    this->setResolution((ledc_timer_bit_t)resolution);
-}
-
 void Servo::begin(SemaphoreHandle_t *mutex){
     xSemaphoreTakeRecursive(*mutex, 10/portTICK_PERIOD_MS);
     this->begin();
     xSemaphoreGive(*mutex);
-
 }
 
 void Servo::begin(){
-
     // check if the pwm pin is set
     if (_pwm_pin < 0) {
         ESP_LOGE(_name, "PWM pin not set");
         return;
     }
-    // check timer is set
-    if (_timer == LEDC_TIMER_MAX) {
-        ESP_LOGE(_name, "Timer not set");
-        return;
-    }
-    // check resolution is set
-    if (_resolution == LEDC_TIMER_BIT_MAX) {
-        ESP_LOGE(_name, "Resolution not set");
-        return;
-    }
 
-    // initialize timer
-    ledc_timer_config_t timer_conf{
-        .speed_mode = _mode,
-        .duty_resolution = _resolution,
-        .timer_num = _timer,
-        .freq_hz = _frequency,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    esp_err_t res = ledc_timer_config(&timer_conf);
-    if (res != ESP_OK) {
-        ESP_LOGE(_name, "Error configuring timer: %s", esp_err_to_name(res));
-    }
-    else{
-        ESP_LOGV(_name, "Timer configured successfully");
-    }
-    int duty = this->usToTicks(1500);
-    ledc_channel_config_t ledc_conf{
-        .gpio_num = _pwm_pin,
-        .speed_mode = _mode,
-        .channel = _channel,
-        .intr_type = LEDC_INTR_FADE_END, // need to change this
-        .timer_sel = _timer,
-        .duty = (uint32_t)duty,
-        .hpoint = 0,
-        .flags = 0
-    };
+    // MCPWM TIMER
+    ESP_LOGD(_name, "Create timer and operator");
+    ESP_ERROR_CHECK(mcpwm_new_timer(&_timer_conf, &_timer));
+    // MCPWM OPERATOR
+    ESP_ERROR_CHECK(mcpwm_new_operator(&_oper_conf, &_oper));
+    ESP_LOGD(_name, "Connect timer and operator");
+    ESP_ERROR_CHECK(mcpwm_operator_connect_timer(_oper, _timer));
 
-    res = ledc_channel_config(&ledc_conf);
+    // MCPWM COMPARATOR
+    ESP_LOGD(_name, "Create comparator and generator from the operator");
+    ESP_ERROR_CHECK(mcpwm_new_comparator(_oper, &_comparator_conf, &_comparator));
 
-    if (res != ESP_OK) {
-        ESP_LOGE(_name, "Error configuring channel: %s", esp_err_to_name(res));
-    }
-    else{
-        ESP_LOGI(_name, "Channel configured successfully");
-    }
+    // MCPWM GENERATOR
+    ESP_ERROR_CHECK(mcpwm_new_generator(_oper, &_generator_conf, &_generator));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(_comparator, 1500));
+    ESP_LOGD(_name, "set generator action on timer and compare event");
 
-    delay(500);
-    ledc_set_duty(_mode, _channel, 0);
-    ledc_update_duty(_mode, _channel);
+    // go high on counter empty
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(_generator,
+                    MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
+    // go low on compare threshold
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(_generator,
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, _comparator, MCPWM_GEN_ACTION_LOW)));
+    ESP_LOGD(_name, "Enable and start timer");
+    ESP_ERROR_CHECK(mcpwm_timer_enable(_timer));
+    ESP_ERROR_CHECK(mcpwm_timer_start_stop(_timer, MCPWM_TIMER_START_NO_STOP));
 
     if (_use_feedback) {
         if (_feedback_pin < 0) {
@@ -186,25 +141,50 @@ void Servo::begin(){
                 ESP_LOGI(_name, "Calibration successful");
             }
         }
-
     }
 }
+
+void Servo::syncTimerTEZ(mcpwm_timer_handle_t timers[]){
+    // sync the timer with the other timers
+    //          +->timer1
+    // (TEZ)    |
+    // timer0---+
+    //          |
+    //          +->timer2
+    ESP_LOGD(_name, "Create TEZ sync source from timer0");
+    mcpwm_sync_handle_t timer_sync_source = NULL;
+    mcpwm_timer_sync_src_config_t timer_sync_config = {
+        .timer_event = MCPWM_TIMER_EVENT_EMPTY, // generate sync event on timer empty
+    };
+
+    ESP_ERROR_CHECK(mcpwm_new_timer_sync_src(_timer, &timer_sync_config, &timer_sync_source));
+
+    ESP_LOGD(_name, "Set other timers sync to the first timer");
+    mcpwm_timer_sync_phase_config_t sync_phase_config = {
+        .count_value = 0,
+        .direction = MCPWM_TIMER_DIRECTION_UP,
+        .sync_src = timer_sync_source,
+    };
+    for (int i = 1; i < sizeof(timers)/sizeof(mcpwm_timer_handle_t); i++) {
+        ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timers[i], &sync_phase_config));
+    }
+
+    ESP_LOGD(_name, "Wait some time for the timer TEZ event");
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
 
 void Servo::setName(char *name){
     strcpy(_name, name);
 }
 
-int Servo::usToTicks(int usec){
-    /*
-    value = (pulse_width     /(  1   /  pwm_frequency    * 2**timer_resolution))
-    */
-    return (int)((double)usec / (((double)1000000/(double)_frequency) / (double)pow(2, (double)_resolution) ));
+void Servo::setGroup(int group){
+    // group must be set before begin
+    _timer_conf.group_id = group;
+    _oper_conf.group_id = group;
 }
 
-int Servo::ticksToUs(int ticks){
-    return (int)((double)ticks * (((double)1000000/(double)_frequency) / (double)pow(2,(double)_resolution)));
 
-}
 
 bool Servo::calibrate(){
     return Servo::calibrate(10000);
@@ -249,7 +229,6 @@ bool Servo::calibrate(int ms){
     for (;;)
     {
         _feedback = analogRead(_feedback_pin);
-
         if(_feedback >= max-10){
             pwm_max = cur_pwm;
             flag = -1;
@@ -321,20 +300,6 @@ float Servo::_map(float val, float in_min, float in_max, float out_min, float ou
     return (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-void Servo::writeTicks(int ticks){
-    // write the ticks to the servo
-    if (ticks < 0) {
-        ESP_LOGE(_name, "Invalid ticks: %d. Ticks must be greater than 0", ticks);
-        return;
-    }
-    if (ticks > (int)pow(2, (int)_resolution)) {
-        ESP_LOGE(_name, "Invalid ticks: %d. Ticks must be less than %d", ticks, (int)pow(2,(int)_resolution));
-        return;
-    }
-    ledc_set_duty(_mode, _channel, ticks);
-    ledc_update_duty(_mode, _channel);
-}
-
 void Servo::writeMicroseconds(int usec){
     
     // write the microseconds to the servo
@@ -346,26 +311,18 @@ void Servo::writeMicroseconds(int usec){
         ESP_LOGE(_name, "Invalid microseconds: %d. Microseconds must be less than %d", usec, _pwm_max);
         return;
     }
-    this->writeTicks(this->usToTicks(usec));
-}
-
-void Servo::writeTicksSafe(int ticks){
-    if (_feedback_pin==-1)
-        ESP_LOGE(_name, "feedback pin not set");
-    else if (_feedback_max == -1 || _feedback_min == -1)
-        ESP_LOGE(_name, "Servo is not calibrated");
-    int us = ticksToUs(ticks);
-    if (us>=_pwm_max){
-        
-    }
-}
-
-int Servo::get_ticks(){
-    return (int)ledc_get_duty(_mode, _channel);
+    _pwm_val = usec;
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(_comparator, usec));
 }
 
 int Servo::get_pwm(){
-    return (int)ticksToUs(get_ticks());
+    /*
+    return the current pwm value in microseconds (int)
+    */
+    return _pwm_val;
 }
 
+void Servo::get_timer(mcpwm_timer_handle_t *timer){
+    *timer = _timer;
+    return;
 }
