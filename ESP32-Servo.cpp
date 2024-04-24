@@ -1,5 +1,7 @@
 #include "ESP32-Servo.h"
 
+// #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+// ESP_LOG_LEVEL_LOCAL(ESP_LOG_INFO);
 namespace ESP32Servo{
 
 Servo::Servo() : Servo(MIN_PULSE_WIDTH, MAX_PULSE_WIDTH, false){}
@@ -14,17 +16,18 @@ Servo::Servo(int min, int max, bool use_feedback){
     _channel = LEDC_CHANNEL_MAX; // MAX for unset
     _mode = LEDC_LOW_SPEED_MODE;
     _frequency = 50;
-    _angle = 0;
-    _duty = -1;
+    // _angle = 0;
+    // _duty = -1;
 
+    // for constraint the movement of the servo
     _feedback = -1;
-    _feedback_min = -1;
-    _feedback_max = -1;
-    _feedback_pin = -1;
+    _feedback_min = -1; //min analog value set with calibration
+    _feedback_max = -1; //max analog value set with calibration
+    _feedback_pin = -1; 
     _use_feedback = use_feedback; 
 
-    _min = min;
-    _max = max;
+    _pwm_min = min;
+    _pwm_max = max;
     _pwm_pin = -1;
     _deg_max = 90.0;
     _deg_min = 0.0;
@@ -35,6 +38,8 @@ Servo::Servo(int min, int max, bool use_feedback){
 
 Servo::~Servo(){
     // Destructor
+    free(_name);
+    ledc_stop(_mode, _channel, 0);
 }
 
 
@@ -93,7 +98,6 @@ void Servo::setResolution(ledc_timer_bit_t resolution){
         ESP_LOGE(_name, "Invalid resolution: %d. Valid resolutions are 0-%d", (int)resolution, (int)(LEDC_TIMER_BIT_MAX-1));
         return;
     }
-
     _resolution = resolution;
 }
 
@@ -101,6 +105,12 @@ void Servo::setResolution(int resolution){
     this->setResolution((ledc_timer_bit_t)resolution);
 }
 
+void Servo::begin(SemaphoreHandle_t *mutex){
+    xSemaphoreTakeRecursive(*mutex, 10/portTICK_PERIOD_MS);
+    this->begin();
+    xSemaphoreGive(*mutex);
+
+}
 
 void Servo::begin(){
 
@@ -135,14 +145,14 @@ void Servo::begin(){
     else{
         ESP_LOGV(_name, "Timer configured successfully");
     }
-
+    int duty = this->usToTicks(1500);
     ledc_channel_config_t ledc_conf{
         .gpio_num = _pwm_pin,
         .speed_mode = _mode,
         .channel = _channel,
         .intr_type = LEDC_INTR_FADE_END, // need to change this
         .timer_sel = _timer,
-        .duty = 0,
+        .duty = (uint32_t)duty,
         .hpoint = 0,
         .flags = 0
     };
@@ -153,7 +163,7 @@ void Servo::begin(){
         ESP_LOGE(_name, "Error configuring channel: %s", esp_err_to_name(res));
     }
     else{
-        ESP_LOGV(_name, "Channel configured successfully");
+        ESP_LOGI(_name, "Channel configured successfully");
     }
 
     delay(500);
@@ -197,17 +207,24 @@ int Servo::ticksToUs(int ticks){
 }
 
 bool Servo::calibrate(){
+    return Servo::calibrate(10000);
+}
+
+bool Servo::calibrate(int ms){
+    // ms -> time calibration in miliseconds
     if (_feedback_pin < 0) {
             ESP_LOGE(_name, "Feedback pin not set");
             return false;
     }
         // to calibrate the range of motion of the servo
+    
     int min = 4096;
     int max = 0;
-    ESP_LOGI(_name, "Calibration is running for 15 seconds");
+    ESP_LOGI(_name, "Calibration is running for %d seconds", ms/1000);
+    ESP_LOGI(_name, "Please move/turn the servo");
     TickType_t tick_start = xTaskGetTickCount();
-    ESP_LOGV(_name, "Calibration started at %d", (int)tick_start);
-    while (xTaskGetTickCount() - tick_start < 15000 / portTICK_PERIOD_MS){
+    ESP_LOGD(_name, "Calibration started at %d", (int)tick_start);
+    while (xTaskGetTickCount() - tick_start < ms / portTICK_PERIOD_MS){
         _feedback = analogRead(_feedback_pin);
         if (_feedback < min) {
             min = _feedback;
@@ -215,12 +232,49 @@ bool Servo::calibrate(){
         if (_feedback > max) {
             max = _feedback;
         }
-        ESP_LOGV(_name, "Feedback: %d, Min: %d, Max: %d", _feedback, min, max);
+        
+        ESP_LOGD(_name, "Feedback: %d, Min: %d, Max: %d", _feedback, min, max);
         ESP_LOGV(_name, "Calibration is running for %d seconds", (int)(xTaskGetTickCount() - tick_start) / 1000);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
-    ESP_LOGI(_name, "Calibration completed");
+    ESP_LOGI(_name, "Reading complete");
     ESP_LOGI(_name, "Min: %d, Max: %d", min, max);
-    this->setCalibration(min,max);
+    ESP_LOGW(_name, "MOVING SERVO");
+    this->begin();
+    int pwm_min = 2500;
+    int pwm_max = 500;
+    int cur_pwm = 1500;
+    int8_t flag = 1;
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    for (;;)
+    {
+        _feedback = analogRead(_feedback_pin);
+
+        if(_feedback >= max-10){
+            pwm_max = cur_pwm;
+            flag = -1;
+        }
+        if(_feedback<=min+10){
+            pwm_min = cur_pwm;
+            break;
+        }
+        if(cur_pwm>=_pwm_max || cur_pwm<=_pwm_min){
+            if(cur_pwm>=_pwm_max)
+                max = _feedback;
+            else
+                min = _feedback;
+            ESP_LOGE(_name, "Servo reached the end of its range of motion");
+        }
+        ESP_LOGD(_name, "Feedback: %d, Min: %d, Max: %d, PWM: %d", _feedback, min, max, cur_pwm);
+        this->writeMicroseconds(cur_pwm);
+        cur_pwm += flag;
+        vTaskDelay(50/portTICK_PERIOD_MS); //20Hz
+    }
+
+    ESP_LOGI(_name, "Calibration completed");
+    ESP_LOGI(_name, "Min analog: %d, Max analog: %d", min, max);
+    ESP_LOGI(_name, "Min PWM: %d Max PWM: %d", pwm_min, pwm_max);
+    this->setCalibration(min, max,pwm_min,pwm_max);
     return true;
 }
 
@@ -230,36 +284,41 @@ int Servo::read(){
         ESP_LOGE(_name, "Feedback pin not set");
         return 0;
     }
-    analogRead(_feedback_pin);
+    _feedback= analogRead(_feedback_pin);
     
     return _feedback;
 }
 
 float Servo::readDeg(){
     // read the feedback pin and convert to degrees
-    if (_feedback_pin < 0) {
-        ESP_LOGE(_name, "Feedback pin not set");
-        return 0;
-    }
-    analogRead(_feedback_pin);
-    return _map(_feedback, _feedback_min, _feedback_max, _deg_min, _deg_max);
+    return _map(read(), _feedback_min, _feedback_max, _deg_min, _deg_max);
 }
 
-void Servo::setCalibration(int min, int max){
+void Servo::setCalibration(int analog_min, int analog_max, int pwm_min, int pwm_max){
     // set the calibration range
-    // _angle_min minimum value of the analog feedback
-    // _angle_max maximum value of the analog feedback
-    _feedback_min = min;
-    _feedback_max = max;
+    _feedback_min = analog_min;
+    _feedback_max = analog_max;
+    _pwm_max = pwm_max;
+    _pwm_min = pwm_min;
+}
+
+void Servo::setAngleDegreesLimit(float min, float max){
+    _deg_min = min;
+    _deg_max = max;
 }
 
 double Servo::_map(double val, double in_min, double in_max, double out_min, double out_max){
     // map the value from one range to another
     return (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
-double Servo::_map(int val, int in_min, int in_max, float out_min, float out_max){
+
+float Servo::_map(int val, int in_min, int in_max, float out_min, float out_max){
     // map the value from one range to another
-    return _map((double)val, (double)in_min, (double)in_max, (double)out_min, (double)out_max);
+    return _map((float)val, (float)in_min, (float)in_max, (float)out_min, (float)out_max);
+}
+
+float Servo::_map(float val, float in_min, float in_max, float out_min, float out_max){
+    return (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
 void Servo::writeTicks(int ticks){
@@ -277,15 +336,36 @@ void Servo::writeTicks(int ticks){
 }
 
 void Servo::writeMicroseconds(int usec){
+    
     // write the microseconds to the servo
-    if (usec < _min) {
-        ESP_LOGE(_name, "Invalid microseconds: %d. Microseconds must be greater than %d", usec, _min);
+    if (usec < _pwm_min) {
+        ESP_LOGE(_name, "Invalid microseconds: %d. Microseconds must be greater than %d", usec, _pwm_min);
         return;
     }
-    if (usec > _max) {
-        ESP_LOGE(_name, "Invalid microseconds: %d. Microseconds must be less than %d", usec, _max);
+    if (usec > _pwm_max) {
+        ESP_LOGE(_name, "Invalid microseconds: %d. Microseconds must be less than %d", usec, _pwm_max);
         return;
     }
     this->writeTicks(this->usToTicks(usec));
 }
+
+void Servo::writeTicksSafe(int ticks){
+    if (_feedback_pin==-1)
+        ESP_LOGE(_name, "feedback pin not set");
+    else if (_feedback_max == -1 || _feedback_min == -1)
+        ESP_LOGE(_name, "Servo is not calibrated");
+    int us = ticksToUs(ticks);
+    if (us>=_pwm_max){
+        
+    }
+}
+
+int Servo::get_ticks(){
+    return (int)ledc_get_duty(_mode, _channel);
+}
+
+int Servo::get_pwm(){
+    return (int)ticksToUs(get_ticks());
+}
+
 }

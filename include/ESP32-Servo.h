@@ -13,6 +13,7 @@
 #define MIN_PULSE_WIDTH       500     // the shortest pulse sent to a servo  
 #define MAX_PULSE_WIDTH      2500     // the longest pulse sent to a servo 
 #define DEFAULT_PULSE_WIDTH  1500     // default pulse width when servo is attached
+
 /*
     This servo class is used to control a servo motor using the LEDC peripheral of the ESP32.
     The servo motor is controlled by a PWM signal with a frequency of 50Hz and a duty cycle of 5% to 10%.
@@ -46,6 +47,7 @@ namespace ESP32Servo{
         void setFeedbackPin(int pin);
         
         void begin();
+        void begin(SemaphoreHandle_t *mutex);
 
         void setFrequency(uint32_t frequency);
 
@@ -59,10 +61,15 @@ namespace ESP32Servo{
         void setChannel(int channel);
 
         bool calibrate();
-        void setCalibration(int min, int max);
-
+        bool calibrate(int);
+        void setCalibration(int analog_min, int analog_max, int pwm_min, int pwm_max);
+        void setAngleDegreesLimit(float min, float max);
         void writeTicks(int ticks);
         void writeMicroseconds(int usec);
+        void writeTicksSafe(int ticks);
+        void writeMicrosecondsSafe(int usec);
+        int get_ticks();
+        int get_pwm();
 
         int read();
         float readDeg();
@@ -75,25 +82,35 @@ namespace ESP32Servo{
         ledc_channel_t _channel;
         int _pwm_pin;
         int _feedback_pin;
-        int _min;
-        int _max;
+        uint32_t _cur_ticks;
+        // not yet used
+        // int _min;
+        // int _max;
+        // float _angle;
+        // int _prev_feedback;
+
         ledc_timer_bit_t _resolution;
         ledc_timer_t _timer;
         ledc_mode_t _mode;
         uint32_t _frequency;
-        int _angle;
+
         int _duty;
         int _feedback;
-        // int _angle_min;
-        // int _angle_max;
+
         int _feedback_min;
         int _feedback_max;
+
+        int _pwm_min;
+        int _pwm_max;
         float _deg_max;
         float _deg_min;
         bool _use_feedback;
         char *_name;
 
+        void _check_max_pwm(void *);
+
         double _map(double val, double in_min, double in_max, double out_min, double out_max);
-        double _map(int val, int in_min, int in_max, float out_min, float out_max);
+        float _map(int val, int in_min, int in_max, float out_min, float out_max);
+        float _map(float val, float in_min, float in_max, float out_min, float out_max);
     };
 }
